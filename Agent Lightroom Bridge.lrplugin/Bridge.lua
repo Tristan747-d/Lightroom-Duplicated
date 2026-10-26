@@ -1421,9 +1421,9 @@ applyDedupe = function(command)
             else
                 nm = m
             end
-            if pt and pt ~= '' and byPath[pt] then return byPath[pt], nm end
-            if nm and nm ~= '' and byName[nm] then return byName[nm], nm end
-            return nil, nm
+            if pt and pt ~= '' and byPath[pt] then return byPath[pt], tostring(nm or pt) end
+            if nm and nm ~= '' and byName[nm] then return byName[nm], tostring(nm) end
+            return nil, tostring(nm or pt or '?')
         end
         for _, g in ipairs(plan.groups or {}) do
             local members, bestPhoto = {}, nil
@@ -1435,7 +1435,9 @@ applyDedupe = function(command)
                     local mk = type(m) == 'table' and (m.path or m.name) or m
                     if mk == bestKey then bestPhoto = p end
                 else
-                    missing[#missing + 1] = tostring(nm or m)
+                    local mn = type(nm) == 'string' and nm
+                               or (type(m) == 'table' and (m.name or m.path)) or tostring(m)
+                    missing[#missing + 1] = tostring(mn)
                 end
             end
             if #members >= 2 then
