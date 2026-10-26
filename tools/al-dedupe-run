@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+"""al-dedupe-run —— 一键跑完「扫描 → 写回 Lightroom → 验证」。
+
+    tools/al-dedupe-run                      # 当前打开的目录
+    tools/al-dedupe-run --catalog X.lrcat
+    tools/al-dedupe-run --skip-writeback     # 只扫描，不写回
+
+为什么需要它：
+  原来要三步：al-dedupe 生成 plan → al-cmd 发写回 → 自己 health 看结果。
+  中间任一步失败都得人工判断。这里串起来并做验收：
+    · 写回后核对插件回报的 groups 数 / 标签数是否与 plan 一致
+    · 不一致或 missing 就明确报错并退出非 0，不谎报成功
+
+前提：Lightroom 里已点过「Agent Lightroom: Start Bridge」，
+      且插件已载入当前版本（改过 Bridge.lua 要「重新载入」）。
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+AL_DEDUPE = os.path.join(HERE, "al-dedupe")
+AL_CMD = os.path.join(HERE, "al-cmd")
+PLAN_PATH = "/tmp/al-dedupe-plan.json"
+REPORT_PATH = "/tmp/al-dedupe-report.txt"
+
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--catalog", help="指定 .lrcat；默认取 Lightroom 当前打开的")
+    ap.add_argument("--collection", default="_Duplicates")
+    ap.add_argument("--burst-window", type=float, default=15.0)
+    ap.add_argument("--no-vision", action="store_true")
+    ap.add_argument("--skip-writeback", action="store_true", help="只扫描生成 plan，不写回")
+    ap.add_argument("--path-map", default=os.environ.get("AL_DEDUPE_PATH_MAP", ""))
+    args = ap.parse_args()
+
+    # ── 1. 扫描 ──────────────────────────────────────────────────────
+    cmd = [AL_DEDUPE, "--report", "--plan-out", PLAN_PATH]
+    if args.catalog:
+        cmd += ["--catalog", args.catalog]
+    if args.collection:
+        cmd += ["--collection", args.collection]
+    if args.burst_window:
+        cmd += ["--burst-window", str(args.burst_window)]
+    if args.no_vision:
+        cmd += ["--no-vision"]
+    if args.path_map:
+        cmd += ["--path-map", args.path_map]
+
+    print("── 扫描 ──────────────────────────────", file=sys.stderr)
+    r = run(cmd)
+    print(r.stderr, end="", file=sys.stderr)
+    if r.returncode != 0:
+        print("❌ 扫描失败", file=sys.stderr)
+        return 1
+
+    try:
+        plan = json.load(open(PLAN_PATH))
+    except Exception as e:
+        print(f"❌ plan 读取失败: {e}", file=sys.stderr)
+        return 1
+
+    n_groups = len(plan["groups"])
+    n_members = sum(len(g["members"]) for g in plan["groups"])
+    print(f"\n✅ 扫描完成：{n_groups} 组 / {n_members} 张", file=sys.stderr)
+    if n_groups == 0:
+        print("目录里没有重复，无需写回。", file=sys.stderr)
+        return 0
+    if args.skip_writeback:
+        print(f"（--skip-writeback）plan: {PLAN_PATH}  报告: {REPORT_PATH}", file=sys.stderr)
+        return 0
+
+    # ── 2. 写回 ──────────────────────────────────────────────────────
+    print("\n── 写回 Lightroom ────────────────────", file=sys.stderr)
+    r = run([AL_CMD, '{"type":"dedupe"}', "--expect", "ok,degraded,error",
+             "--timeout", "120", "--attempts", "4"])
+    out = r.stdout.strip()
+    print(out, file=sys.stderr)
+
+    # 取最后一行 JSON 作为终态
+    final = None
+    for line in reversed(out.splitlines()):
+        line = line.strip()
+        if line.startswith("{") and '"status"' in line:
+            try:
+                final = json.loads(line)
+                break
+            except Exception:
+                continue
+    if not final:
+        print("❌ 写回未拿到终态回报（插件未响应？Bridge 是否 Start 过？）", file=sys.stderr)
+        return 1
+
+    status = final.get("status")
+    msg = final.get("message", "")
+
+    # ── 3. 验收 ──────────────────────────────────────────────────────
+    print("\n── 验收 ──────────────────────────────", file=sys.stderr)
+    got_groups = None
+    got_labels = None
+    for tok in msg.split():
+        if tok.startswith("groups="):
+            try:
+                got_groups = int(tok.split("=")[1])
+            except ValueError:
+                pass
+        if tok.startswith("labels="):
+            try:
+                got_labels = int(tok.split("=")[1])
+            except ValueError:
+                pass
+
+    ok = True
+    if status in ("ok", "degraded"):
+        if got_groups is not None and got_groups != n_groups:
+            print(f"⚠️  写回组数 {got_groups} ≠ plan 组数 {n_groups}", file=sys.stderr)
+            ok = False
+        if got_labels is not None and got_labels != n_members:
+            print(f"⚠️  标色数 {got_labels} ≠ plan 成员数 {n_members}", file=sys.stderr)
+            ok = False
+        if "missing=" in msg:
+            print(f"⚠️  有成员没找到: {msg.split('missing=')[1]}", file=sys.stderr)
+            ok = False
+        if "collection=NONE" in msg:
+            print("⚠️  收藏夹未建成（色标已写，但没入夹）", file=sys.stderr)
+            ok = False
+    else:
+        print(f"❌ 写回失败: {msg}", file=sys.stderr)
+        return 1
+
+    if ok:
+        print(f"✅ 全部一致：{n_groups} 组 / {n_members} 张已写入 "
+              f"{plan.get('collection', '_Duplicates')}", file=sys.stderr)
+        print(f"   报告: {REPORT_PATH}", file=sys.stderr)
+        return 0
+    print(f"⚠️  写回完成但有不一致，请检查：{msg}", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
