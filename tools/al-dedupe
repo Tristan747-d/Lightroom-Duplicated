@@ -1,0 +1,408 @@
+#!/usr/bin/env python3
+"""al-dedupe —— 基于视觉的重复照片筛选（Lightroom Classic 目录）。
+
+为什么必须"基于视觉"而不是 md5：
+  本机实测 AgLibraryFile.md5 **全为 NULL**（LR 15.5 不填该列），且重复导入、
+  连拍、导出再导入的文件字节本来就不同。只有视觉指纹（dHash）能抓到
+  "同一张图/同一场景"——这正是选片真正的痛点。
+
+为什么不在 Lua 插件里算（关键架构约束）：
+  LR SDK 里 **os.execute / io.popen 不存在**，且 LrFileUtils.writeFile 为 nil
+  （见 README-LR.md "本机 LR 15.5 SDK 实测"）。插件**无法**调用本机程序、
+  也拿不到像素。所以分工是：
+      Python（本机）  读 LR 预览缓存 JPEG → dHash → 分组 → al-vision 选最佳
+      Lua 插件        只做写回：建收藏夹 + 标色（它能做且已验证）
+  预览缓存本身就是 LR 渲染的 JPEG（含 develop 设定），天然满足
+  "预览必须是 LR 内编辑后的样子"，且零插件依赖。
+
+两档判定（阈值来自 dHash 汉明距离，64bit）：
+  ① exact  完全重复：同图多副本/重复导入。距离 ≤ 4（几乎零误判）
+  ② burst  连拍近似：同一场景多张。距离 ≤ 12 **且** 拍摄时间相邻（默认 15s 内）
+           ——时间邻近做交叉验证，单靠宽松阈值会把"同一面墙拍的不同照片"误并。
+
+每组选"最佳"用 tools/al-vision（macOS Vision，离线）：
+  主体/人脸锐度 + 人脸睁眼 + 曝光溢出 + 美学分，加权排序。
+  数值参数不出给模型，纯确定性规则 → 可解释、可复现。
+
+用法：
+    tools/al-dedupe                          # 当前打开的目录，全量扫描
+    tools/al-dedupe --catalog X.lrcat        # 指定目录
+    tools/al-dedupe --burst-window 30        # 连拍时间窗口放宽到 30s
+    tools/al-dedupe --dry-run                # 只输出计划，不写 plan 文件
+    tools/al-dedupe --no-vision              # 跳过选最佳（只用时间+分辨率，快）
+输出：
+    /tmp/al-dedupe-plan.json  —— 插件 dedupe 命令的输入
+      {"catalog":..., "collection":"_Duplicates",
+       "groups":[{"kind":"exact|burst","best":"NAME","members":["A","B"],
+                  "sim":0.97,"reason":"..."}]}
+退出码: 0 成功 / 1 失败。
+"""
+import argparse
+import glob
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import time
+from datetime import datetime
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+AL_VISION = os.path.join(HERE, "al-vision")
+PLAN_PATH = "/tmp/al-dedupe-plan.json"
+PREVIEW_SIZES = re.compile(r"_(\d+)$")
+
+# 阈值（64bit dHash 汉明距离）
+EXACT_MAX_DIST = 4      # 完全重复：极严，误并代价高
+BURST_MAX_DIST = 12     # 连拍近似：宽松，靠时间窗兜底
+DEFAULT_BURST_WINDOW = 15.0   # 秒：连拍组内相邻两张的最大拍摄间隔
+
+# 选最佳权重（越大越重要）
+W_SHARPNESS = 1.0
+W_FACE = 1.2            # 有人脸时，人脸锐度比整图锐度更能回答"合焦"
+W_EYES = 1.5            # 睁闭眼是硬伤，权重最高
+W_AESTHETICS = 0.8
+W_CLIP_PENALTY = 1.0    # 高光/死黑溢出扣分
+
+
+# ── 目录读取 ────────────────────────────────────────────────────────────
+def lr_catalogs():
+    """找出 Lightroom 当前打开的 .lrcat（用 lsof）；失败则退回最近修改的候选。"""
+    found = []
+    try:
+        pids = subprocess.run(["pgrep", "-x", "Adobe Lightroom Classic"],
+                              capture_output=True, text=True, timeout=10).stdout.split()
+        for pid in pids:
+            out = subprocess.run(["lsof", "-p", pid], capture_output=True, text=True,
+                                 timeout=20).stdout
+            for line in out.splitlines():
+                if line.rstrip().endswith(".lrcat"):
+                    path = line.split()[-1]
+                    if path not in found:
+                        found.append(path)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    if found:
+        return found
+    candidates = glob.glob(os.path.expanduser("~/Pictures/Lightroom/*/*.lrcat"))
+    candidates += glob.glob(os.path.expanduser("~/Pictures/*/*.lrcat"))
+    candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    return candidates
+
+
+def load_photos(catalog):
+    """(filename, uuid, captureTime) 列表。
+
+    映射照抄 tools/al-see 的实测结论：预览文件名前缀是 **AgLibraryFile.id_global**，
+    不是 Adobe_images.id_global（用后者查会"找不到预览"）。
+    """
+    con = sqlite3.connect(f"file:{catalog}?mode=ro", uri=True, timeout=15)
+    try:
+        rows = con.execute(
+            "SELECT f.idx_filename, f.id_global, i.captureTime "
+            "FROM AgLibraryFile f JOIN Adobe_images i ON i.rootFile = f.id_local "
+            "WHERE f.id_global IS NOT NULL").fetchall()
+    finally:
+        con.close()
+    return rows
+
+
+def preview_file(catalog, photo_uuid):
+    """找该 UUID 的预览：同尺寸取 mtime 最新（LR 不原地覆盖，会并存多个 hash 家族）。"""
+    base = os.path.splitext(catalog)[0] + " Previews.lrdata"
+    hits = glob.glob(os.path.join(base, "*", "*", photo_uuid + "-*"))
+    if not hits:
+        hits = glob.glob(os.path.join(base, "**", photo_uuid + "-*"), recursive=True)
+    best, best_size, best_mtime = None, -1, -1.0
+    for path in hits:
+        match = PREVIEW_SIZES.search(path)
+        size = int(match.group(1)) if match else 0
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            continue
+        if size > best_size or (size == best_size and mtime > best_mtime):
+            best, best_size, best_mtime = path, size, mtime
+    return best
+
+
+def parse_capture_time(value):
+    """captureTime 实测是 ISO 字符串 '2026-09-23T12:50:36.980'（不是 CF epoch）。"""
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+
+
+# ── dHash ───────────────────────────────────────────────────────────────
+def dhash(path, hash_size=8):
+    """64bit 感知哈希。返回整数；失败返回 None。
+
+    dHash 而非 aHash/pHash：对缩放、轻度裁剪、JPEG 再压缩、轻微曝光变化稳健，
+    而这正是"重复导入 + 连拍"要容忍的差异。
+    """
+    try:
+        from PIL import Image
+        with Image.open(path) as img:
+            img = img.convert("L").resize((hash_size + 1, hash_size), Image.LANCZOS)
+            px = list(img.getdata())
+    except Exception:
+        return None
+    bits = 0
+    for r in range(hash_size):
+        row = r * (hash_size + 1)
+        for c in range(hash_size):
+            bits = (bits << 1) | (1 if px[row + c] < px[row + c + 1] else 0)
+    return bits
+
+
+def hamming(a, b):
+    return bin(a ^ b).count("1")
+
+
+# ── 分组 ────────────────────────────────────────────────────────────────
+def build_groups(entries, burst_window, exact_max=EXACT_MAX_DIST, burst_max=BURST_MAX_DIST):
+    """entries: [{name, uuid, dt, hash, preview}]
+
+    两档：
+      exact —— 只看汉明距离 ≤ exact_max，不看时间（重复导入可能时间不同）
+      burst —— 距离 ≤ burst_max **且** 组内相邻拍摄间隔 ≤ burst_window
+    用并查集做传递闭包；时间复杂度 O(n²)，1617 张在本机约 1.3M 次比较，秒级。
+    """
+    n = len(entries)
+    parent = list(range(n))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    kind_of = {}   # root -> 'exact' | 'burst'
+    for i in range(n):
+        if entries[i]["hash"] is None:
+            continue
+        for j in range(i + 1, n):
+            if entries[j]["hash"] is None:
+                continue
+            dist = hamming(entries[i]["hash"], entries[j]["hash"])
+            if dist <= exact_max:
+                union(i, j)
+                r = find(i)
+                # exact 优先级高于 burst：一旦组内有一对是完全重复，整组按 exact 标
+                if kind_of.get(r) != "exact":
+                    kind_of[r] = "exact"
+            elif dist <= burst_max:
+                ta, tb = entries[i]["dt"], entries[j]["dt"]
+                if ta is None or tb is None:
+                    continue          # 无拍摄时间 → 不敢判连拍（会误并不同场景）
+                if abs((ta - tb).total_seconds()) > burst_window:
+                    continue
+                union(i, j)
+                r = find(i)
+                kind_of.setdefault(r, "burst")
+
+    clusters = {}
+    for i in range(n):
+        if entries[i]["hash"] is None:
+            continue
+        clusters.setdefault(find(i), []).append(i)
+
+    groups = []
+    for root, idxs in clusters.items():
+        if len(idxs) < 2:
+            continue
+        idxs.sort(key=lambda i: (entries[i]["dt"] or datetime.min))
+        hashes = [entries[i]["hash"] for i in idxs]
+        # 组内最大距离 → 换成 0..1 相似度，仅用于展示
+        maxd = 0
+        for a in range(len(hashes)):
+            for b in range(a + 1, len(hashes)):
+                maxd = max(maxd, hamming(hashes[a], hashes[b]))
+        groups.append({
+            "kind": kind_of.get(root, "burst"),
+            "idxs": idxs,
+            "max_dist": maxd,
+            "sim": 1.0 - maxd / 64.0,
+        })
+    groups.sort(key=lambda g: (g["kind"] != "exact", -len(g["idxs"])))
+    return groups
+
+
+# ── 选最佳（al-vision）──────────────────────────────────────────────────
+def vision_metrics(path):
+    """调 al-vision 拿度量；失败返回 None（不因此中断整组）。"""
+    if not os.path.isfile(AL_VISION):
+        return None
+    try:
+        r = subprocess.run([AL_VISION, path], capture_output=True, text=True, timeout=120)
+        if r.returncode != 0 or not r.stdout.strip():
+            return None
+        return json.loads(r.stdout)
+    except Exception:
+        return None
+
+
+def quality_score(metrics, fallback_px):
+    """综合质量分：锐度 + 人脸 + 睁眼 + 美学 − 溢出惩罚。
+
+    没有 al-vision 时退化为分辨率（大图优先），保证流程不卡死。
+    """
+    if not metrics:
+        return float(fallback_px or 0) / 10000.0, "no-vision(按分辨率)"
+    score, notes = 0.0, []
+    sharp = (metrics.get("sharpness") or {}).get("laplacian_var") or 0.0
+    score += W_SHARPNESS * min(sharp, 3000.0) / 1000.0
+    notes.append(f"锐度{sharp:.0f}")
+
+    faces = (metrics.get("faces") or {}).get("items") or []
+    if faces:
+        best_face_sharp = max((f.get("face_sharpness") or 0.0) for f in faces)
+        score += W_FACE * min(best_face_sharp, 3000.0) / 1000.0
+        open_ratio = sum(1 for f in faces if f.get("eyes_open")) / float(len(faces))
+        score += W_EYES * open_ratio
+        closed = len(faces) - sum(1 for f in faces if f.get("eyes_open"))
+        notes.append(f"人脸{len(faces)}" + (f"闭眼{closed}" if closed else "全睁眼"))
+        if closed:
+            score -= W_EYES * 0.5 * closed / float(len(faces))
+
+    aes = (metrics.get("aesthetics") or {}).get("overall_score")
+    if aes is not None:
+        score += W_AESTHETICS * float(aes)
+        notes.append(f"美学{aes:.2f}")
+
+    tone = metrics.get("tone") or {}
+    clip_h = float(tone.get("clipped_high_pct") or 0.0)
+    clip_l = float(tone.get("clipped_low_pct") or 0.0)
+    score -= W_CLIP_PENALTY * (clip_h + clip_l) / 100.0
+    if clip_h + clip_l > 1.0:
+        notes.append(f"溢出{clip_h + clip_l:.1f}%")
+
+    return score, " ".join(notes)
+
+
+def pick_best(entries, idxs, use_vision):
+    scored = []
+    for i in idxs:
+        e = entries[i]
+        metrics = vision_metrics(e["preview"]) if use_vision else None
+        score, why = quality_score(metrics, e.get("preview_px"))
+        scored.append((score, i, why))
+        e["metrics"] = metrics
+    scored.sort(key=lambda t: (-t[0], t[1]))
+    return scored[0], scored
+
+
+# ── 主流程 ──────────────────────────────────────────────────────────────
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--catalog", help="指定 .lrcat；默认取 Lightroom 当前打开的")
+    ap.add_argument("--collection", default="_Duplicates")
+    ap.add_argument("--burst-window", type=float, default=DEFAULT_BURST_WINDOW)
+    ap.add_argument("--exact-max", type=int, default=EXACT_MAX_DIST)
+    ap.add_argument("--burst-max", type=int, default=BURST_MAX_DIST)
+    ap.add_argument("--limit", type=int, default=0, help="只处理前 N 张（调试）")
+    ap.add_argument("--no-vision", action="store_true", help="跳过 al-vision 选最佳")
+    ap.add_argument("--dry-run", action="store_true", help="不写 plan 文件")
+    args = ap.parse_args()
+
+    catalog = args.catalog
+    if not catalog:
+        cands = lr_catalogs()
+        if not cands:
+            print("找不到 Lightroom 目录文件", file=sys.stderr)
+            return 1
+        catalog = cands[0]
+    if not os.path.exists(catalog):
+        print(f"目录不存在: {catalog}", file=sys.stderr)
+        return 1
+
+    t0 = time.time()
+    rows = load_photos(catalog)
+    if args.limit:
+        rows = rows[:args.limit]
+    if not rows:
+        print("目录里没有照片", file=sys.stderr)
+        return 1
+
+    entries, no_preview = [], 0
+    for name, uuid, cap in rows:
+        pv = preview_file(catalog, uuid)
+        if not pv:
+            no_preview += 1
+            continue
+        entries.append({
+            "name": name, "uuid": uuid, "dt": parse_capture_time(cap),
+            "preview": pv, "hash": None,
+            "preview_px": int((PREVIEW_SIZES.search(pv) or [0, 0])[1] or 0),
+        })
+    print(f"目录: {os.path.basename(catalog)}  照片 {len(rows)}  有预览 {len(entries)}  "
+          f"无预览 {no_preview}", file=sys.stderr)
+
+    for e in entries:
+        e["hash"] = dhash(e["preview"])
+    hashed = [e for e in entries if e["hash"] is not None]
+    print(f"指纹完成 {len(hashed)} 张  ({time.time() - t0:.1f}s)", file=sys.stderr)
+
+    groups = build_groups(entries, args.burst_window,
+                          exact_max=args.exact_max, burst_max=args.burst_max)
+    exact_n = sum(1 for g in groups if g["kind"] == "exact")
+    print(f"分组: {len(groups)} 组（完全重复 {exact_n}，连拍 {len(groups) - exact_n}）",
+          file=sys.stderr)
+
+    out_groups = []
+    for g in groups:
+        best, scored = pick_best(entries, g["idxs"], not args.no_vision)
+        best_entry = entries[best[1]]
+        members = [entries[i]["name"] for i in g["idxs"]]
+        runner_up = scored[1] if len(scored) > 1 else None
+        reason = f"{best[2]}"
+        if runner_up:
+            reason += f"｜优于次选 {runner_up[2]}"
+        out_groups.append({
+            "kind": g["kind"],
+            "best": best_entry["name"],
+            "members": members,
+            "sim": round(g["sim"], 3),
+            "max_dist": g["max_dist"],
+            "reason": reason,
+        })
+        print(f"  [{g['kind']}] {len(members)}张 sim={g['sim']:.2f} "
+              f"保留 {best_entry['name']}", file=sys.stderr)
+
+    plan = {
+        "catalog": catalog,
+        "collection": args.collection,
+        "generated_at": time.time(),
+        "thresholds": {
+            "exact_max_dist": args.exact_max,
+            "burst_max_dist": args.burst_max,
+            "burst_window_sec": args.burst_window,
+        },
+        "stats": {
+            "photos": len(rows), "hashed": len(hashed),
+            "no_preview": no_preview, "groups": len(groups), "exact_groups": exact_n,
+        },
+        "groups": out_groups,
+    }
+
+    if args.dry_run:
+        print(json.dumps(plan, ensure_ascii=False, indent=2))
+    else:
+        with open(PLAN_PATH, "w") as fh:
+            json.dump(plan, fh, ensure_ascii=False, indent=2)
+        print(f"计划已写入 {PLAN_PATH}（{len(out_groups)} 组）", file=sys.stderr)
+    print(f"总耗时 {time.time() - t0:.1f}s", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
