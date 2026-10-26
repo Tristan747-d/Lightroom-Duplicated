@@ -70,11 +70,24 @@ pip install Pillow
 
 ## 用法
 
-### 基本流程
+### 基本流程（推荐：一条命令跑完）
 
 ```bash
-# 1. 扫描当前打开的目录，生成去重计划
-tools/al-dedupe
+# 扫描 → 写回 Lightroom → 自动验收（组数/标色数不一致会报错）
+tools/al-dedupe-run
+
+# 指定目录
+tools/al-dedupe-run --catalog "/path/to/Catalog.lrcat"
+
+# 只看结果不写回
+tools/al-dedupe-run --skip-writeback
+```
+
+### 分步流程（需要细调时）
+
+```bash
+# 1. 扫描，生成去重计划 + 人类可读报告
+tools/al-dedupe --report
 
 # 2. 写回 Lightroom（建收藏夹 + 色标）
 tools/al-cmd '{"type":"dedupe"}'
@@ -93,11 +106,19 @@ tools/al-dedupe [选项]
 
   --catalog PATH         指定 .lrcat（默认自动检测 Lightroom 当前打开的）
   --collection NAME      收藏夹名称（默认 _Duplicates）
-  --burst-window SEC     连拍时间窗口，秒（默认 15）
-  --exact-max N          完全重复汉明距离阈值（默认 4）
-  --burst-max N          连拍近似汉明距离阈值（默认 12）
+  --burst-window SEC     连拍相邻间隔，秒（默认 15）
+  --group-span-h H       exact 组内最大时间跨度，小时（默认 6，防跨场景误并）
+  --path-map MAP         Windows 盘符映射，如 'G:/=/Volumes/G/'
+                         （也可设 AL_DEDUPE_PATH_MAP 环境变量）
+  --report               额外写人类可读报告到 /tmp/al-dedupe-report.txt
+  --no-cache             禁用指纹缓存（默认启用，命中时全库扫描 5 秒）
   --limit N              只处理前 N 张（调试）
   --no-vision            跳过 al-vision 选最佳（只用分辨率，秒级完成）
+
+判定阈值（由 labs/dedupe 实验标定，勿随意改）：
+  exact  hist64 L1/2 ≤ 0.12 且 dHash8 ≤ 8     （synthetic 变体：召回98%，误判0%）
+  burst  结构加权 4x4 区域 sim ≥ 0.55 且 时间连续（间隔≤15s，段跨度≤60s）
+  门控   梯度能量 ≥ 3.0（排除纯天空/死黑等"黑洞"帧）
   --dry-run              只打印计划，不写文件
 ```
 
