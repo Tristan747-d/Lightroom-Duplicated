@@ -664,6 +664,33 @@ def main():
         print(f"  [{g['kind']}] {len(members)}张 指标={g['metric']} 跨度={g['span_s']}s "
               f"保留 {best_entry['name']}", file=sys.stderr)
 
+    # ── 路径可达性自检 ───────────────────────────────────────────────
+    # 写回靠 path 精确定位。若 path 指向的盘符在本机不存在（本目录有 G:/ 等
+    # Windows 盘，实测 110/175 成员如此），插件会退化为按 fileName 查找，
+    # 而目录里有 12 个重名文件（相机计数器重置）→ 可能标错对象。
+    # 不静默放过：统计并告警，要求用 --path-map 显式映射。
+    unresolved, ambiguous = [], []
+    by_name = {}
+    for e in entries:
+        by_name.setdefault(e["name"], []).append(e)
+    for g in out_groups:
+        for m in g["members"]:
+            if not m.get("path") or not os.path.exists(m["path"]):
+                unresolved.append(m["name"])
+                if len(by_name.get(m["name"], [])) > 1:
+                    ambiguous.append(m["name"])
+    if unresolved:
+        print(f"\n⚠️  路径在本机不存在：{len(unresolved)} 张（例：{unresolved[:3]}）", file=sys.stderr)
+        print(f"    Lightroom 会退化为按文件名查找。", file=sys.stderr)
+        if ambiguous:
+            print(f"    ❗ 其中 {len(ambiguous)} 张存在重名（{ambiguous[:4]}），"
+                  f"按文件名定位【可能标错照片】。", file=sys.stderr)
+        if not args.path_map:
+            print(f"    → 请用 --path-map 'G:/=/Volumes/盘名/' 映射，"
+                  f"或设 AL_DEDUPE_PATH_MAP 环境变量。", file=sys.stderr)
+        else:
+            print(f"    （已应用 --path-map，仍不可用请检查映射是否正确）", file=sys.stderr)
+
     plan = {
         "catalog": catalog,
         "collection": args.collection,
@@ -680,6 +707,7 @@ def main():
             "no_preview": no_preview, "no_preview_names": no_preview_names[:20],
             "groups": len(groups), "exact_groups": exact_n,
             "verify_mode": ("semantic" if use_vision else "hash-only"),
+            "unresolved_paths": len(unresolved), "ambiguous_fallback": sorted(set(ambiguous)),
             "semantic_skipped": gstats.get("semantic_skipped", 0),
         },
         "groups": out_groups,
