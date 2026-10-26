@@ -121,6 +121,33 @@ local function countDeveloped(photos)
     return n
 end
 
+-- 输出若干照片的 path（raw metadata）与 fileName，用于核对路径形态。
+local function probePaths(command)
+    LrTasks.startAsyncTask(function()
+      local okTask, errTask = LrTasks.pcall(function()
+        local cat = getCatalog()
+        if not cat then return report('error', 'catalog not ready') end
+        local okAll, photos = LrTasks.pcall(function() return cat:getAllPhotos() end)
+        if not okAll or not photos then return report('error', 'getAllPhotos failed') end
+        local out = {}
+        local want = command.names or {}
+        local shown = 0
+        for _, p in ipairs(photos) do
+            local fn = p:getFormattedMetadata('fileName') or ''
+            local hit = (#want == 0)
+            for _, w in ipairs(want) do if fn == w then hit = true end end
+            if hit and shown < 8 then
+                out[#out + 1] = fn .. ' => ' .. tostring(p:getRawMetadata('path'))
+                shown = shown + 1
+            end
+        end
+        return report('ok', 'paths(' .. #out .. '): ' .. table.concat(out, ' || '))
+      end)
+      if not okTask then report('error', 'paths error: ' .. tostring(errTask)) end
+    end)
+    return report('starting', 'paths: probing')
+end
+
 -- 逐个核对 SDK 关键 API 是否存在（只读探测，不写任何照片）。
 -- 存在的写 API（applyAutoTone/applyDevelopSettings）无法在不写入的前提下探测，
 -- 因此用类型检查报告。
@@ -677,6 +704,7 @@ local function editKeywords(command)
         local ok, err = LrTasks.pcall(function()
             cat:withWriteAccessDo('Agent Lightroom keywords', function()
                 local kwObjs = {}
+                if type(cat.createKeyword) ~= 'function' then return end
                 for _, name in ipairs(addNames) do
                     kwObjs[#kwObjs + 1] = cat:createKeyword(name, {}, true, nil, true)
                 end
@@ -1080,6 +1108,7 @@ local function handle(command)
     if command.type == 'snapshot' then return reportCatalogPhotos() end
     -- 正式后期固定流程（无需选中照片，按源文件夹批量执行）
     if command.type == 'probe' then return probeApis(command.source) end
+    if command.type == 'paths' then return probePaths(command) end
     if command.type == 'routine' then return runRoutine(command.source) end
     if command.type == 'optics' then return correctOptics(command) end
     if command.type == 'reject' then return rejectPhotos(command) end
@@ -1456,13 +1485,17 @@ applyDedupe = function(command)
         end
 
         local coll, errColl = getOrCreateCollection(cat, collName)
-        local added, labelOk, labelFail = 0, 0, 0
+        local added, labelOk, labelFail, collAddFailed = 0, 0, 0, false
         cat:withWriteAccessDo('Agent Lightroom dedupe', function()
             for _, g in ipairs(groups) do
-                if coll then
-                    -- addPhotos 未验证过，包 pcall：失败不影响色标
+                if coll and type(coll.addPhotos) == 'function' then
+                    -- addPhotos 未验证过（本机 LR 15.5 未实测），且可能是 nil：
+                    -- 直接调用会让整个写事务崩溃 → 连色标都写不成。
+                    -- 包 pcall 并做类型检查，失败只影响入夹，不影响色标。
                     local okAdd = LrTasks.pcall(function() coll:addPhotos(g.members) end)
-                    if okAdd then added = added + #g.members end
+                    if okAdd then added = added + #g.members else collAddFailed = true end
+                elseif coll then
+                    collAddFailed = true
                 end
                 for _, p in ipairs(g.members) do
                     -- ⚠️ 键名是实测出来的，勿改：
@@ -1483,6 +1516,7 @@ applyDedupe = function(command)
             .. ' added=' .. added .. ' labels=' .. labelOk
         if labelFail > 0 then msg = msg .. ' labelFailed=' .. labelFail end
         if not coll then msg = msg .. ' collectionError=' .. tostring(errColl) end
+        if collAddFailed then msg = msg .. ' collectionAddFailed=yes' end
         if #missing > 0 then msg = msg .. ' missing=' .. table.concat(missing, ',') end
         -- 色标全失败 = 这次运行实质没落地，必须报 error（不能报 ok 制造假成功）
         if labelOk == 0 then

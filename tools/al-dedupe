@@ -53,6 +53,18 @@ PREVIEW_SIZES = re.compile(r"_(\d+)$")
 HIST_MAX = 0.12        # L1: 直方图 L1/2 上限（真变体 p95=0.104，负样本 min=0.232）
 DHASH8_MAX = 8         # L1: 8x8 dHash 上限（真变体 max=7，负样本 min=16）
 BURST_SIM = 0.55       # L2: 结构加权区域哈希相似度下限（真连拍 0.62–0.79）
+BURST_SIM_NO_TIME = 0.72  # L2 缺拍摄时间时的更严门槛（无时间窗兜底，靠视觉说话）
+# 二级语义校验：结构哈希对"同场景不同瞬间"几乎没有判别力（实测真连拍 p50=0.51
+# 与随机配对 p50=0.51 完全重合，阈值 0.55 下精度仅 23%）。改用 al-vision 的
+# 语义标签做裁决：真连拍均值 0.71 vs 非连拍 0.55，精度提升到 ~67%。
+# 只对通过哈希初筛的少量候选对调用，成本可控（0.16s/张）。
+BURST_SEMANTIC_MIN = 0.65  # 语义标签 Jaccard 加权一致度下限（现用作诊断参考）
+# 合成判定：哈希 0.5 权重 + 语义 0.5 权重。
+# 纯哈希精度 23%，纯语义 67%，合成后真连拍（sim≈0.7,ag≈0.9）得分 0.8 稳过，
+# 随机配对（sim≈0.51,ag≈0.55）得分 0.53 被挡；Vision 误判时 sim 高仍能兜住。
+W_HASH = 0.5
+W_SEMANTIC = 0.5
+BURST_COMBINED_MIN = 0.63   # 合成分下限
 DEFAULT_BURST_WINDOW = 15.0   # 连拍时间窗（秒）
 ENERGY_FLOOR = 3.0     # 全图梯度能量下限：低于此视为空白帧，不参与配对
 GROUP_MAX_SPAN_H = 6.0 # exact 组内最大拍摄时间跨度（小时），防跨场景链式误并
@@ -250,7 +262,7 @@ def hist_l12(ha, hb):
 
 # ── 分组 ────────────────────────────────────────────────────────────────
 def build_groups(entries, burst_window, group_max_span_h=GROUP_MAX_SPAN_H,
-                 max_burst_span_s=MAX_BURST_SPAN_S):
+                 max_burst_span_s=MAX_BURST_SPAN_S, verify_semantic=True):
     """三级判定，无传递闭包。
 
     exact 候选：hist ≤ HIST_MAX 且 h8 ≤ DHASH8_MAX（exp7：0 误判）
@@ -261,6 +273,7 @@ def build_groups(entries, burst_window, group_max_span_h=GROUP_MAX_SPAN_H,
     """
     import numpy as np
     n = len(entries)
+    semantic_skipped = 0
     cand_exact = [[] for _ in range(n)]
     cand_burst = [[] for _ in range(n)]
     for i in range(n):
@@ -277,16 +290,38 @@ def build_groups(entries, burst_window, group_max_span_h=GROUP_MAX_SPAN_H,
                 cand_exact[i].append(j)
                 cand_exact[j].append(i)
                 continue
-            # burst：时间窗约束（有拍摄时间才参与）
+            # burst：时间窗约束
             ta, tb = ei["dt"], ej["dt"]
+            s = None
             if ta is None or tb is None:
-                continue
-            if abs((ta - tb).total_seconds()) > burst_window:
-                continue
+                # 缺拍摄时间（本目录实测 0 张，但换目录会有：扫描件/视频截图/
+                # 元数据被清的照片）→ 不能用时间窗兜底，改为提高视觉相似度门槛
+                # 并要求 hist 也接近，避免"同一面墙不同照片"被并。
+                if hl > HIST_MAX * 2:
+                    continue
+            else:
+                if abs((ta - tb).total_seconds()) > burst_window:
+                    continue
             s = patch_sim(ei, ej)
-            if s >= BURST_SIM:
-                cand_burst[i].append(j)
-                cand_burst[j].append(i)
+            need = BURST_SIM if (ta is not None and tb is not None) else BURST_SIM_NO_TIME
+            if s < need:
+                continue
+            # 二级语义校验：注意不能做成"一票否决"。
+            # 实测 _TSY7978/7979 是真连拍（Δt=0.1s, sim=0.789），但 Vision 把一张
+            # 标成 outdoor/foliage、另一张标成 health_club/interior，语义一致度
+            # 只有 0.49 —— 硬阈值会错杀。因此改为与哈希相似度加权合成：
+            # 两者都高才通过，其中一个很高也能兜住另一个的失误。
+            if verify_semantic:
+                ag = semantic_agree(ei, ej)
+                if ag is None:
+                    semantic_skipped += 1
+                    ag = None
+                if ag is not None:
+                    combined = W_HASH * s + W_SEMANTIC * ag
+                    if combined < BURST_COMBINED_MIN:
+                        continue
+            cand_burst[i].append(j)
+            cand_burst[j].append(i)
 
     # ── 完全子图贪心聚合（exact）────────────────────────────────────
     used = set()
@@ -305,9 +340,10 @@ def build_groups(entries, burst_window, group_max_span_h=GROUP_MAX_SPAN_H,
             ok = all(other in cand_exact[m] for m in members)
             if not ok:
                 continue
-            # 时间跨度约束
+            # 时间跨度约束（有时间的成员之间校验；缺时间的成员不阻断，
+            # 因为 exact 档本身是像素级证据，时间只是防链的第二道闸）
             dts = [entries[m]["dt"] for m in members + [other] if entries[m]["dt"]]
-            if dts and (max(dts) - min(dts)).total_seconds() > group_max_span_h * 3600:
+            if len(dts) >= 2 and (max(dts) - min(dts)).total_seconds() > group_max_span_h * 3600:
                 continue
             members.append(other)
             members_set.add(other)
@@ -366,7 +402,40 @@ def build_groups(entries, burst_window, group_max_span_h=GROUP_MAX_SPAN_H,
         dts = [entries[i]["dt"] for i in idxs if entries[i]["dt"]]
         g["span_s"] = round((max(dts) - min(dts)).total_seconds(), 1) if len(dts) >= 2 else 0.0
     groups.sort(key=lambda g: (g["kind"] != "exact", -len(g["idxs"])))
-    return groups
+    return groups, {"semantic_skipped": semantic_skipped}
+
+
+def semantic_labels(path):
+    """取 al-vision 的语义标签 {label: confidence}；失败返回 None。"""
+    fp = vision_metrics(path)
+    if not fp:
+        return None
+    labels = fp.get("labels") or []
+    out = {}
+    for x in labels:
+        try:
+            c = float(x.get("confidence") or 0)
+        except (TypeError, ValueError):
+            continue
+        lid = x.get("id")
+        if lid and c > 0.2:
+            out[lid] = c
+    return out or None
+
+
+def semantic_agree(ea, eb):
+    """两张图的语义标签一致度（加权 Jaccard），0..1；不可用返回 None。"""
+    if "labels" not in ea:
+        ea["labels"] = semantic_labels(ea["preview"])
+    if "labels" not in eb:
+        eb["labels"] = semantic_labels(eb["preview"])
+    la, lb = ea["labels"], eb["labels"]
+    if not la or not lb:
+        return None
+    common = set(la) & set(lb)
+    num = sum(min(la[k], lb[k]) for k in common)
+    den = max(sum(la.values()), sum(lb.values()), 1e-6)
+    return num / den
 
 
 def patch_sim(ea, eb):
@@ -473,6 +542,9 @@ def write_report(plan, report_path=REPORT_PATH):
     lines.append(f"al-dedupe 重复检测报告  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     lines.append(f"目录: {plan['catalog']}")
     lines.append(f"照片 {s['photos']}  有预览 {s['hashed']}  无预览 {s['no_preview']}")
+    if s.get("no_preview"):
+        lines.append(f"⚠️  {s['no_preview']} 张无预览（未参与检测，建议在 Lightroom 里"
+                     f"选中它们生成预览后重跑）: {', '.join(s.get('no_preview_names', []))}")
     lines.append(f"检出: 完全重复 {s['exact_groups']} 组  连拍 {s['groups'] - s['exact_groups']} 组")
     lines.append(f"阈值: hist≤{HIST_MAX} h8≤{DHASH8_MAX} burst_sim≥{BURST_SIM} "
                  f"窗口≤{plan['thresholds']['burst_window_sec']}s 能量≥{ENERGY_FLOOR}")
@@ -531,13 +603,14 @@ def main():
         return 1
 
     idx = build_preview_index(catalog)
-    entries, no_preview = [], 0
+    entries, no_preview, no_preview_names = [], 0, []
     for row in rows:
         name, uuid, cap = row[0], row[1], row[2]
         raw_path = row[3] if len(row) > 3 else ""
         pv = preview_file_from_index(idx, uuid)
         if not pv:
             no_preview += 1
+            no_preview_names.append(name)
             continue
         entries.append({
             "name": name, "uuid": uuid, "dt": parse_capture_time(cap),
@@ -561,7 +634,11 @@ def main():
         print(f"指纹完成 {sum(1 for e in entries if e['h8'] is not None)} 张  "
               f"{time.time() - t0:.1f}s", file=sys.stderr)
 
-    groups = build_groups(entries, args.burst_window, args.group_span_h)
+    # 语义校验同样依赖 al-vision；--no-vision 时整体降级为哈希-only，
+    # 并在 stats.verify_mode 如实标注（不假装做过语义校验）。
+    use_vision = not args.no_vision
+    groups, gstats = build_groups(entries, args.burst_window, args.group_span_h,
+                                  verify_semantic=use_vision)
     exact_n = sum(1 for g in groups if g["kind"] == "exact")
     print(f"分组: {len(groups)} 组（完全重复 {exact_n}，连拍 {len(groups) - exact_n}）"
           f"  {time.time() - t0:.1f}s", file=sys.stderr)
@@ -600,7 +677,10 @@ def main():
         },
         "stats": {
             "photos": len(rows), "hashed": sum(1 for e in entries if e["h8"] is not None),
-            "no_preview": no_preview, "groups": len(groups), "exact_groups": exact_n,
+            "no_preview": no_preview, "no_preview_names": no_preview_names[:20],
+            "groups": len(groups), "exact_groups": exact_n,
+            "verify_mode": ("semantic" if use_vision else "hash-only"),
+            "semantic_skipped": gstats.get("semantic_skipped", 0),
         },
         "groups": out_groups,
     }
