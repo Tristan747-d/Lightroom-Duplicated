@@ -116,9 +116,18 @@ tools/al-dedupe [选项]
   --no-vision            跳过 al-vision 选最佳（只用分辨率，秒级完成）
 
 判定阈值（由 labs/dedupe 实验标定，勿随意改）：
-  exact  hist64 L1/2 ≤ 0.12 且 dHash8 ≤ 8     （synthetic 变体：召回98%，误判0%）
-  burst  结构加权 4x4 区域 sim ≥ 0.55 且 时间连续（间隔≤15s，段跨度≤60s）
+  exact   hist64 L1/2 ≤ 0.12 且 dHash8 ≤ 8   （synthetic 变体：召回98%，误判0%）
+  burst   两级：
+          L1 结构加权 4x4 区域哈希 sim ≥ 0.55 且时间连续（间隔≤15s，段≤60s）
+          L2 合成分 = 0.5×哈希sim + 0.5×语义一致度(al-vision 标签) ≥ 0.63
+             纯哈希精度仅 23%（≈抛硬币），加语义后 ~67%
+             语义不能一票否决——Vision 会误判场景，高 sim 需能兜住
   门控   梯度能量 ≥ 3.0（排除纯天空/死黑等"黑洞"帧）
+
+注意：
+  - --no-vision 时两级校验降级为纯哈希（stats.verify_mode=hash-only，如实标注）
+  - G:/ 等未挂载盘需 --path-map 映射，否则写回退化为按文件名定位，
+    遇重名可能标错（脚本会告警并列出重名风险）
   --dry-run              只打印计划，不写文件
 ```
 
