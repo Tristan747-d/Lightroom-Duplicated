@@ -1436,10 +1436,18 @@ applyDedupe = function(command)
         if not okAll2 or not photos2 then
             return report('error', 'dedupe: getAllPhotos failed')
         end
-        local byPath, byName = {}, {}
+        -- byPathLower: 大小写不敏感兜底（Mac 文件系统一般不区分大小写，但目录里
+        -- 有 .JPG/.jpg 混用；path 精确匹配失败时用 lower 键再试一次）。
+        -- 只在【唯一】大小写不敏感命中时才采用，避免撞上真正不同的同名文件。
+        local byPath, byName, byPathLower, pathLowerCount = {}, {}, {}, {}
         for _, it in ipairs(photos2) do
             local pt = it:getRawMetadata('path') or ''
-            if pt ~= '' and not byPath[pt] then byPath[pt] = it end
+            if pt ~= '' then
+                if not byPath[pt] then byPath[pt] = it end
+                local lp = string.lower(pt)
+                pathLowerCount[lp] = (pathLowerCount[lp] or 0) + 1
+                byPathLower[lp] = it
+            end
             local nm = it:getFormattedMetadata('fileName') or ''
             if nm ~= '' and not byName[nm] then byName[nm] = it end
         end
@@ -1450,7 +1458,13 @@ applyDedupe = function(command)
             else
                 nm = m
             end
-            if pt and pt ~= '' and byPath[pt] then return byPath[pt], tostring(nm or pt) end
+            if pt and pt ~= '' then
+                if byPath[pt] then return byPath[pt], tostring(nm or pt) end
+                local lp = string.lower(pt)
+                if byPathLower[lp] and pathLowerCount[lp] == 1 then
+                    return byPathLower[lp], tostring(nm or pt)
+                end
+            end
             if nm and nm ~= '' and byName[nm] then return byName[nm], tostring(nm) end
             return nil, tostring(nm or pt or '?')
         end
