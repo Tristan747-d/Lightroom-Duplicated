@@ -319,6 +319,26 @@ local function findPhotoByName(cat, name)
     return nil
 end
 
+-- ⚠️ 同名不同图（相机计数器重置导致重名）：实测本目录有 12 个文件名对应 24 张
+-- 不同照片，只按 fileName 查找会命中第一个 → 标错对象。
+-- findPhotoByPath 用完整绝对路径精确匹配，是去重写回的唯一可信定位方式。
+local function findPhotoByPath(cat, path)
+    if not path or path == '' then return nil end
+    local okAll, photos = LrTasks.pcall(function() return cat:getAllPhotos() end)
+    if not okAll or not photos then return nil end
+    for _, item in ipairs(photos) do
+        if (item:getRawMetadata('path') or '') == path then return item end
+    end
+    return nil
+end
+
+-- 按 path 优先、fileName 兜底地定位一张照片。
+local function findPhoto(cat, path, name)
+    local p = findPhotoByPath(cat, path)
+    if p then return p end
+    return findPhotoByName(cat, name)
+end
+
 -- 渲染核心：给定照片名（空/'-' = 当前选中）与长边尺寸，产出 /tmp 下的 JPEG。
 -- 返回 (status, message)；status ∈ {'view','error'}。必须在 task 上下文调用
 -- （内部有 yield：getAllPhotos、异步回调等待）。
@@ -712,11 +732,15 @@ local function collections(command)
                     if command.name and nm == command.name and not found then
                         found = c
                     end
-                    local kids = c:getChildCollections()
-                    if kids and #kids > 0 then walk(kids, depth + 1) end
+                    if type(c.getChildCollections) == 'function' then
+                        local kids = c:getChildCollections()
+                        if kids and #kids > 0 then walk(kids, depth + 1) end
+                    end
                 end
             end
-            walk(cat:getChildCollections(), 0)
+            if type(cat.getChildCollections) == 'function' then
+                walk(cat:getChildCollections(), 0)
+            end
         end)
 
         if command.list or not command.name then
@@ -1326,21 +1350,23 @@ end
 -- 因此整体包 LrTasks.pcall，失败时回退为「只标色、不建夹」并诚实回报 degraded。
 local function getOrCreateCollection(cat, name)
     local found = nil
-    local okRead = LrTasks.pcall(function()
-        -- ⚠️ 实测：不在 withReadAccessDo 里遍历会拿到空列表（曾报 collections(0)
-        -- 而目录里其实有 9 个集合）——照 collections 命令的已验证写法。
-        cat:withReadAccessDo(function()
-            local function walk(colls)
-                for _, c in ipairs(colls) do
-                    if c:getName() == name and not found then found = c end
+    -- ⚠️ 不能用 LrTasks.pcall 包 withReadAccessDo（yield API，套 pcall 会抛
+    --  "Yielding is not allowed within a C or metamethod call"，实测报
+    --  collection scan failed）——照 collections 命令的已验证写法裸调用。
+    cat:withReadAccessDo(function()
+        local function walk(colls)
+            for _, c in ipairs(colls) do
+                if c:getName() == name and not found then found = c end
+                if type(c.getChildCollections) == 'function' then
                     local kids = c:getChildCollections()
                     if kids and #kids > 0 then walk(kids) end
                 end
             end
+        end
+        if type(cat.getChildCollections) == 'function' then
             walk(cat:getChildCollections())
-        end)
+        end
     end)
-    if not okRead then return nil, 'collection scan failed' end
     if found then return found, nil end
 
     local created, errCreate = nil, nil
@@ -1370,18 +1396,46 @@ applyDedupe = function(command)
         end
 
         local collName = plan.collection or command.collection or '_Duplicates'
-        -- 先解析全部文件名 → photo 对象（findPhotoByName 内部有 getAllPhotos，
-        -- 一次遍历一张太慢；且必须在写事务外做，避免事务内做 yield 查询）。
+        -- 解析成员 → photo 对象。必须在写事务外做（内部 getAllPhotos 有 yield）。
+        -- 成员既支持旧格式（字符串=文件名），也支持 v2 格式（{name=.., path=..}）：
+        -- 有 path 一律按绝对路径精确匹配，规避"同名不同图"。
         local groups, missing = {}, {}
+        -- ⚠️ 性能：逐张扫描 getAllPhotos 做成员解析是 O(成员数 × 照片数)，
+        -- 128 组 × 1466 张会把 async task 拖到 LR 判定超时（实测卡在 starting）。
+        -- 一次性建 path→photo 与 name→photo 索引，解析变 O(1)。
+        local okAll2, photos2 = LrTasks.pcall(function() return cat:getAllPhotos() end)
+        if not okAll2 or not photos2 then
+            return report('error', 'dedupe: getAllPhotos failed')
+        end
+        local byPath, byName = {}, {}
+        for _, it in ipairs(photos2) do
+            local pt = it:getRawMetadata('path') or ''
+            if pt ~= '' and not byPath[pt] then byPath[pt] = it end
+            local nm = it:getFormattedMetadata('fileName') or ''
+            if nm ~= '' and not byName[nm] then byName[nm] = it end
+        end
+        local function resolveOne(m)
+            local nm, pt = nil, nil
+            if type(m) == 'table' then
+                nm, pt = m.name, m.path
+            else
+                nm = m
+            end
+            if pt and pt ~= '' and byPath[pt] then return byPath[pt], nm end
+            if nm and nm ~= '' and byName[nm] then return byName[nm], nm end
+            return nil, nm
+        end
         for _, g in ipairs(plan.groups or {}) do
             local members, bestPhoto = {}, nil
-            for _, n in ipairs(g.members or {}) do
-                local p = findPhotoByName(cat, n)
+            local bestKey = type(g.best) == 'table' and (g.best.path or g.best.name) or g.best
+            for _, m in ipairs(g.members or {}) do
+                local p, nm = resolveOne(m)
                 if p then
                     members[#members + 1] = p
-                    if n == g.best then bestPhoto = p end
+                    local mk = type(m) == 'table' and (m.path or m.name) or m
+                    if mk == bestKey then bestPhoto = p end
                 else
-                    missing[#missing + 1] = n
+                    missing[#missing + 1] = tostring(nm or m)
                 end
             end
             if #members >= 2 then
@@ -1390,7 +1444,7 @@ applyDedupe = function(command)
                     groups[#groups + 1] = { members = members, best = bestPhoto,
                                             kind = g.kind or 'burst' }
                 else
-                    missing[#missing + 1] = tostring(g.best) .. '(best-missing)'
+                    missing[#missing + 1] = tostring(bestKey) .. '(best-missing)'
                 end
             end
         end
